@@ -9,12 +9,19 @@
 import argparse
 import glob
 import os
+import pathlib
 import re
 import sys
+import sysconfig
 import shutil
 
-from distutils.core import setup, Extension
-from distutils.util import change_root
+from setuptools import setup, Extension
+from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
+from setuptools.command.install import install
+
+# from distutils.core import setup, Extension
+# from distutils.util import change_root
 
 import create_shadertext
 
@@ -137,15 +144,106 @@ def guess_msgpackc():
 
 
 # Important: import 'distutils.command' modules after monkeypatch_distutils
-from distutils.command.build_ext import build_ext
-from distutils.command.build_py import build_py
-from distutils.command.install import install
+# from distutils.command.build_ext import build_ext
+# from distutils.command.build_py import build_py
+# from distutils.command.install import install
+
+class CMakeExtension(Extension):
+
+    def __init__(self,
+                 name,
+                 sources,
+                 include_dirs=[],
+                 libraries=[],
+                 library_dirs=[],
+                 define_macros=[],
+                 extra_link_args=[],
+                 extra_compile_args=[],
+                 extra_objects=[]):
+        # don't invoke the original build_ext for this special extension
+        super().__init__(name, sources=[])
+        self.sources = sources
+        self.include_dirs = include_dirs
+        self.include_dirs.append(sysconfig.get_paths()['include'])
+        if sys.platform.startswith('linux'):
+            self.include_dirs.append(sysconfig.get_paths()['platinclude'])
+        self.libraries = libraries
+        self.library_dirs = library_dirs
+        self.define_macros = define_macros
+        self.extra_link_args = extra_link_args
+        self.extra_compile_args = extra_compile_args
+        self.extra_objects = extra_objects
+
 
 class build_ext_pymol(build_ext):
-    def initialize_options(self):
-        build_ext.initialize_options(self)
-        if DEBUG and not WIN:
-            self.debug = True
+    def run(self):
+        for ext in self.extensions:
+            self.build_cmake(ext)
+
+    def build_cmake(self, ext):
+        cwd = pathlib.Path().absolute()
+
+        # these dirs will be created in build_py, so if you don't have
+        # any python sources to bundle, the dirs will be missing
+        name_split = ext.name.split('.')
+        target_name = name_split[-1]
+        build_temp = pathlib.Path(self.build_temp) / target_name
+        print(f"BUILDTMP {build_temp}")
+        build_temp.mkdir(parents=True, exist_ok=True)
+        extdir = pathlib.Path(self.get_ext_fullpath(ext.name))
+        extdir.mkdir(parents=True, exist_ok=True)
+
+        def concat_paths(paths):
+            return ''.join(path.replace('\\', '/') + ";" for path in paths)
+
+        py_lib = pathlib.Path(sysconfig.get_paths()['stdlib']).parent / 'libs'
+        ext.library_dirs.append(str(py_lib))
+
+        config = 'Debug' if DEBUG else 'Release'
+        lib_output_dir = str(extdir.parent.absolute())
+        print(f"LIB OUTPUT DIR: {lib_output_dir}")
+        all_files = ext.sources
+        all_src = concat_paths(all_files)
+        all_defs = ''.join(mac[0] + ";" for mac in ext.define_macros)
+        all_libs = ''.join(f"{lib};" for lib in ext.libraries)
+        all_ext_link = ''.join(f"{arg};" for arg in ext.extra_link_args)
+        all_lib_dirs = concat_paths(ext.library_dirs)
+        all_inc_dirs = concat_paths(ext.include_dirs)
+        all_ext_objs = concat_paths(ext.extra_objects)
+
+        lib_mode = "RUNTIME" if WIN else "LIBRARY"
+
+        cmake_args = [
+            f"-DTARGET_NAME={target_name}",
+            f"-DCMAKE_{lib_mode}_OUTPUT_DIRECTORY={lib_output_dir}",
+            f"-DCMAKE_BUILD_TYPE={config}",
+            f"-DALL_INC_DIR={all_inc_dirs}",
+            f"-DALL_SRC={all_src}",
+            f"-DALL_DEF={all_defs}",
+            f"-DALL_LIB_DIR={all_lib_dirs}",
+            f"-DALL_LIB={all_libs}",
+            f"-DALL_EXT_LINK={all_ext_link}",
+        ]
+        # print(sys.platform)
+        # print(f"ALL INC DIR: {all_inc_dirs}")
+        # print(sysconfig.get_paths()['platinclude'])
+
+        if all_ext_objs:
+            cmake_args.append("-DALL_EXT_OBJ=" + all_ext_objs)
+
+        # example of build args
+        build_args = ['--config', config]
+        if not WIN:  # Win /MP flag on compilation level
+            cpu_count = os.cpu_count() or 1
+            build_args += [f'-j{cpu_count}']
+
+        os.chdir(str(build_temp))
+        self.spawn(['cmake', str(cwd)] + cmake_args)
+        if not self.dry_run:
+            self.spawn(['cmake', '--build', '.'] + build_args)
+        # Troubleshooting: if fail on line above then delete all possible
+        # temporary CMake files including "CMakeCache.txt" in top level dir.
+        os.chdir(str(cwd))
 
 
 class build_py_pymol(build_py):
@@ -174,7 +272,8 @@ class install_pymol(install):
             self.pymol_path = os.path.join(
                 self.install_libbase, 'pymol', 'pymol_path')
         elif self.root is not None:
-            self.pymol_path = change_root(self.root, self.pymol_path)
+            self.pymol_path = install_pymol.change_root(
+                self.root, self.pymol_path)
 
     def run(self):
         install.run(self)
@@ -521,22 +620,30 @@ package_dir = dict((x, os.path.join(base, x))
                    for base in ['modules']
                    for x in get_packages(base))
 
-ext_modules += [
-    Extension("pymol._cmd",
-              get_sources(pymol_src_dirs),
-              include_dirs=inc_dirs,
-              libraries=libs,
-              library_dirs=lib_dirs,
-              define_macros=def_macros,
-              extra_link_args=ext_link_args,
-              extra_compile_args=ext_comp_args,
-              extra_objects=ext_objects,
-              ),
+champ_inc_dirs = ['contrib/champ']
 
-    Extension("chempy.champ._champ",
-              get_sources(['contrib/champ']),
-              include_dirs=["contrib/champ"],
-              ),
+if sys.platform == 'linux':
+    inc_dirs.append(sysconfig.get_paths()['platinclude'])
+    champ_inc_dirs.append(sysconfig.get_paths()['platinclude'])
+
+ext_modules += [
+    CMakeExtension(
+        name="pymol._cmd",
+        sources=get_sources(pymol_src_dirs),
+        include_dirs=inc_dirs,
+        libraries=libs,
+        library_dirs=lib_dirs,
+        define_macros=def_macros,
+        extra_link_args=ext_link_args,
+        extra_compile_args=ext_comp_args,
+        extra_objects=ext_objects,
+    ),
+
+    Extension(
+        name="chempy.champ._champ",
+        sources=get_sources(['contrib/champ']),
+        include_dirs=champ_inc_dirs,
+    ),
 ]
 
 distribution = setup(  # Distribution meta-data
